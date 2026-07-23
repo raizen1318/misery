@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+void bytes_to_hex(const unsigned char *bytes, size_t len, char *out);
+int  hex_to_bytes(const char *hex, size_t hexLen, unsigned char *out, size_t outLen);
+
 #define AES_KEY_SIZE_256 32
 #define SALT_SIZE        16
 #define IV_SIZE          16
