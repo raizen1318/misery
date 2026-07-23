@@ -242,7 +242,7 @@ static bool FindFirstEncryptedFileAndSalt(BYTE *outSalt, char *outPath,
                     }
                 }
             }
-        } while (FindNextFileW(hSub ? hSub : hFind, &fdw));
+        } while (FindNextFileW(hFind, &fdw));
         FindClose(hFind);
     }
     return false;
